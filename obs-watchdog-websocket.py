@@ -7,6 +7,8 @@ import base64
 import hashlib
 import websocket
 import threading
+import socket
+import configparser
 from datetime import datetime
 
 print("OBS Stream Watchdog - WebSocket Version")
@@ -14,17 +16,74 @@ print("======================================")
 print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print()
 
-# Configuration
-CHECK_INTERVAL = 10  # seconds between checks
-OBS_WEBSOCKET_HOST = "localhost"
-OBS_WEBSOCKET_PORT = 4444
-OBS_WEBSOCKET_PASSWORD = "fewture"  # Password for OBS WebSocket
+# Load configuration from file
+config = configparser.ConfigParser()
+config_file = 'obs-watchdog-config.ini'
+
+# Default configuration
+DEFAULT_CONFIG = {
+    'WebSocket': {
+        'Host': 'localhost',
+        'Port': '4444',
+        'Password': 'fewture',
+        'MaxRetries': '3',
+        'RetryDelay': '5'
+    },
+    'Watchdog': {
+        'CheckInterval': '10',
+        'UseFallbackOnFailure': 'true',
+        'DebugMode': 'true'
+    }
+}
+
+# Check if config file exists, create it if it doesn't
+if not os.path.exists(config_file):
+    print(f"Configuration file {config_file} not found, creating with default values...")
+    config.read_dict(DEFAULT_CONFIG)
+    with open(config_file, 'w') as f:
+        config.write(f)
+    print(f"Created configuration file {config_file}")
+else:
+    print(f"Loading configuration from {config_file}...")
+    config.read(config_file)
+
+# Load configuration values
+try:
+    OBS_WEBSOCKET_HOST = config.get('WebSocket', 'Host')
+    OBS_WEBSOCKET_PORT = config.getint('WebSocket', 'Port')
+    OBS_WEBSOCKET_PASSWORD = config.get('WebSocket', 'Password')
+    MAX_RETRIES = config.getint('WebSocket', 'MaxRetries')
+    RETRY_DELAY = config.getint('WebSocket', 'RetryDelay')
+    
+    CHECK_INTERVAL = config.getint('Watchdog', 'CheckInterval')
+    USE_FALLBACK_ON_FAILURE = config.getboolean('Watchdog', 'UseFallbackOnFailure')
+    DEBUG_MODE = config.getboolean('Watchdog', 'DebugMode')
+    
+    print("Configuration loaded successfully")
+except Exception as e:
+    print(f"Error loading configuration: {e}")
+    print("Using default values")
+    
+    # Default configuration values
+    OBS_WEBSOCKET_HOST = 'localhost'
+    OBS_WEBSOCKET_PORT = 4444
+    OBS_WEBSOCKET_PASSWORD = 'fewture'
+    MAX_RETRIES = 3
+    RETRY_DELAY = 5
+    CHECK_INTERVAL = 10
+    USE_FALLBACK_ON_FAILURE = True
+    DEBUG_MODE = True
+
+# Enable WebSocket trace if in debug mode
+if DEBUG_MODE:
+    websocket.enableTrace(True)
 
 # Global variables
 ws = None
 streaming_status = False
 message_id = 1
 connected = False
+connection_retries = 0
 
 def is_obs_running():
     """Check if OBS is running by looking for the process"""
@@ -38,9 +97,44 @@ def is_obs_running():
     except subprocess.CalledProcessError:
         return False
 
+def check_websocket_server():
+    """Check if the WebSocket server is accessible"""
+    try:
+        print(f"Checking if WebSocket server is accessible at {OBS_WEBSOCKET_HOST}:{OBS_WEBSOCKET_PORT}...")
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2)
+        result = s.connect_ex((OBS_WEBSOCKET_HOST, OBS_WEBSOCKET_PORT))
+        s.close()
+        
+        if result == 0:
+            print("WebSocket server is accessible")
+            return True
+        else:
+            print(f"WebSocket server is not accessible (error code: {result})")
+            print("Possible reasons:")
+            print("1. OBS is not running")
+            print("2. WebSocket server is not enabled in OBS")
+            print("3. WebSocket server is using a different port")
+            print("4. Firewall is blocking the connection")
+            print("5. Incorrect host/IP address")
+            print("\nTo enable WebSocket in OBS:")
+            print("1. Open OBS")
+            print("2. Go to Tools > WebSocket Server Settings")
+            print("3. Check 'Enable WebSocket server'")
+            print("4. Set Server Port to match your configuration")
+            print("5. Set a password if required")
+            return False
+    except Exception as e:
+        print(f"Error checking WebSocket server: {e}")
+        return False
+
 def connect_websocket():
     """Connect to OBS WebSocket"""
-    global ws, connected
+    global ws, connected, connection_retries
+    
+    # First check if the WebSocket server is accessible
+    if not check_websocket_server():
+        return False
     
     try:
         # Close existing connection if any
@@ -51,9 +145,6 @@ def connect_websocket():
         ws_url = f"ws://{OBS_WEBSOCKET_HOST}:{OBS_WEBSOCKET_PORT}"
         print(f"Connecting to OBS WebSocket at {ws_url}...")
         print(f"Using password: {OBS_WEBSOCKET_PASSWORD != ''}")
-        
-        # For debugging, use the websocket.enableTrace
-        websocket.enableTrace(True)
         
         ws = websocket.WebSocketApp(
             ws_url,
@@ -74,10 +165,31 @@ def connect_websocket():
         while not connected and time.time() - start_time < timeout:
             time.sleep(0.1)
             
-        return connected
+        if connected:
+            connection_retries = 0  # Reset retry counter on successful connection
+            return True
+        else:
+            connection_retries += 1
+            print(f"Failed to connect. Retry {connection_retries}/{MAX_RETRIES}")
+            if connection_retries < MAX_RETRIES:
+                print(f"Retrying in {RETRY_DELAY} seconds...")
+                time.sleep(RETRY_DELAY)
+                return connect_websocket()  # Recursive retry
+            else:
+                print("Maximum retries reached. Falling back to keyboard method.")
+                connection_retries = 0  # Reset for next time
+                return False
     except Exception as e:
         print(f"Error connecting to WebSocket: {e}")
-        return False
+        connection_retries += 1
+        if connection_retries < MAX_RETRIES:
+            print(f"Retrying in {RETRY_DELAY} seconds... ({connection_retries}/{MAX_RETRIES})")
+            time.sleep(RETRY_DELAY)
+            return connect_websocket()  # Recursive retry
+        else:
+            print("Maximum retries reached. Falling back to keyboard method.")
+            connection_retries = 0  # Reset for next time
+            return False
 
 def on_open(ws):
     """Called when WebSocket connection is established"""
@@ -89,19 +201,27 @@ def on_message(ws, message):
     global connected, streaming_status, message_id
     
     try:
-        print(f"Raw message received: {message}")
+        if DEBUG_MODE:
+            print(f"Raw message received: {message}")
+        
         data = json.loads(message)
-        print(f"Received message type: {data.get('op')}")
+        
+        if DEBUG_MODE:
+            print(f"Received message type: {data.get('op')}")
         
         # Handle authentication
         if data.get("op") == 0:  # Hello message
             print("Received Hello message")
-            print(f"Full hello message: {data}")
+            
+            if DEBUG_MODE:
+                print(f"Full hello message: {data}")
             
             if "authentication" in data.get("d", {}):
                 # Authentication required
                 auth = data["d"]["authentication"]
-                print(f"Authentication data: {auth}")
+                
+                if DEBUG_MODE:
+                    print(f"Authentication data: {auth}")
                 
                 if OBS_WEBSOCKET_PASSWORD:
                     print("Authentication required, sending credentials...")
@@ -109,26 +229,35 @@ def on_message(ws, message):
                     salt = auth["salt"]
                     challenge = auth["challenge"]
                     
-                    print(f"Salt: {salt}")
-                    print(f"Challenge: {challenge}")
+                    if DEBUG_MODE:
+                        print(f"Salt: {salt}")
+                        print(f"Challenge: {challenge}")
                     
                     # Step 1: Concatenate password and salt
                     step1 = OBS_WEBSOCKET_PASSWORD + salt
-                    print(f"Step 1 (password+salt): {step1}")
+                    
+                    if DEBUG_MODE:
+                        print(f"Step 1 (password+salt): {step1}")
                     
                     # Step 2: SHA256 hash and base64 encode
                     secret_hash = hashlib.sha256(step1.encode()).digest()
                     secret = base64.b64encode(secret_hash).decode()
-                    print(f"Step 2 (secret): {secret}")
+                    
+                    if DEBUG_MODE:
+                        print(f"Step 2 (secret): {secret}")
                     
                     # Step 3: Concatenate secret and challenge
                     step3 = secret + challenge
-                    print(f"Step 3 (secret+challenge): {step3}")
+                    
+                    if DEBUG_MODE:
+                        print(f"Step 3 (secret+challenge): {step3}")
                     
                     # Step 4: SHA256 hash and base64 encode
                     auth_response_hash = hashlib.sha256(step3.encode()).digest()
                     auth_response = base64.b64encode(auth_response_hash).decode()
-                    print(f"Step 4 (auth_response): {auth_response}")
+                    
+                    if DEBUG_MODE:
+                        print(f"Step 4 (auth_response): {auth_response}")
                     
                     # Send authentication
                     auth_payload = {
@@ -138,7 +267,10 @@ def on_message(ws, message):
                             "authentication": auth_response
                         }
                     }
-                    print(f"Sending authentication payload: {auth_payload}")
+                    
+                    if DEBUG_MODE:
+                        print(f"Sending authentication payload: {auth_payload}")
+                    
                     ws.send(json.dumps(auth_payload))
                 else:
                     print("Authentication required but no password provided")
@@ -180,8 +312,9 @@ def on_message(ws, message):
     
     except Exception as e:
         print(f"Error processing message: {e}")
-        import traceback
-        traceback.print_exc()
+        if DEBUG_MODE:
+            import traceback
+            traceback.print_exc()
 
 def on_error(ws, error):
     """Called when a WebSocket error occurs"""
@@ -270,6 +403,15 @@ def main():
     global streaming_status, connected
     
     print("Monitoring OBS streaming status...")
+    print(f"Configuration:")
+    print(f"  - WebSocket Host: {OBS_WEBSOCKET_HOST}")
+    print(f"  - WebSocket Port: {OBS_WEBSOCKET_PORT}")
+    print(f"  - Password Set: {OBS_WEBSOCKET_PASSWORD != ''}")
+    print(f"  - Check Interval: {CHECK_INTERVAL} seconds")
+    print(f"  - Max Retries: {MAX_RETRIES}")
+    print(f"  - Use Fallback: {USE_FALLBACK_ON_FAILURE}")
+    print(f"  - Debug Mode: {DEBUG_MODE}")
+    print()
     print("Press Ctrl+C to stop")
     print()
     
@@ -300,10 +442,12 @@ def main():
                     if not streaming_status:
                         print("OBS is not streaming. Starting stream...")
                         start_streaming()
-                else:
+                elif USE_FALLBACK_ON_FAILURE:
                     print("Not connected to OBS WebSocket. Using fallback method.")
                     # Use fallback method to start streaming
                     start_streaming_keyboard()
+                else:
+                    print("Not connected to OBS WebSocket and fallback is disabled.")
             
             # Wait before next check
             print(f"Checking again in {CHECK_INTERVAL} seconds...")
@@ -316,8 +460,9 @@ def main():
             break
         except Exception as e:
             print(f"Error in main loop: {e}")
-            import traceback
-            traceback.print_exc()
+            if DEBUG_MODE:
+                import traceback
+                traceback.print_exc()
             time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
@@ -335,4 +480,4 @@ if __name__ == "__main__":
             print("Please install it manually with: pip install websocket-client")
             sys.exit(1)
     
-    main() 
+    main()
